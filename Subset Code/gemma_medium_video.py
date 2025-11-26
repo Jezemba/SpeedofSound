@@ -436,7 +436,7 @@ def run_inference_single(model, processor, example, num_video_frames=32):
             # Prepare media
             frames = None
             if media_type == 'video':
-                # Check if the video is a VideoDecoder object
+                # Try VideoDecoder first if available, otherwise use standard extraction
                 try:
                     from torchcodec.decoders import VideoDecoder
                     if isinstance(example['video'], VideoDecoder):
@@ -445,8 +445,12 @@ def run_inference_single(model, processor, example, num_video_frames=32):
                     else:
                         # Extract frames from video path
                         frames = extract_video_frames(example['video'], num_frames=num_video_frames)
-                except (ImportError, Exception):
-                    # Fallback to standard video extraction
+                except ImportError:
+                    # torchcodec not available, use standard video extraction
+                    frames = extract_video_frames(example['video'], num_frames=num_video_frames)
+                except Exception as e:
+                    # Other error occurred, try fallback
+                    print(f"Warning: Error in video extraction ({str(e)}), trying fallback...")
                     frames = extract_video_frames(example['video'], num_frames=num_video_frames)
 
                 if not frames:
