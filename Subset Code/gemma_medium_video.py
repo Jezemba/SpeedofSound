@@ -110,8 +110,22 @@ def load_benchmark_dataset(dataset_name, split='test', media_type='all'):
         Dataset object
     """
     print(f"Loading dataset: {dataset_name}")
+    # Load dataset without automatic video decoding to avoid ImportError issues
+    # We'll decode videos manually later
+    from datasets import Features, Video, Value
+
     dset = load_dataset(dataset_name, split=split, token=True)
-    print(f"Loaded {len(dset)} examples")
+
+    # Set video column to return paths instead of decoded objects
+    if 'video' in dset.column_names:
+        try:
+            dset = dset.cast_column('video', Video(decode=False))
+            print(f"Loaded {len(dset)} examples (videos as paths)")
+        except Exception as e:
+            print(f"Warning: Could not set video decode mode ({e}), continuing...")
+            print(f"Loaded {len(dset)} examples")
+    else:
+        print(f"Loaded {len(dset)} examples")
 
     # Filter by media type using faster approach
     if media_type != "all":
@@ -436,22 +450,27 @@ def run_inference_single(model, processor, example, num_video_frames=32):
             # Prepare media
             frames = None
             if media_type == 'video':
+                # Validate that example['video'] is not an exception object
+                video_obj = example['video']
+                if isinstance(video_obj, Exception):
+                    raise ValueError(f"Video field contains an exception: {video_obj}")
+
                 # Try VideoDecoder first if available, otherwise use standard extraction
                 try:
                     from torchcodec.decoders import VideoDecoder
-                    if isinstance(example['video'], VideoDecoder):
+                    if isinstance(video_obj, VideoDecoder):
                         # Extract frames directly from VideoDecoder
-                        frames = extract_frames_from_videodecoder(example['video'], num_frames=num_video_frames)
+                        frames = extract_frames_from_videodecoder(video_obj, num_frames=num_video_frames)
                     else:
                         # Extract frames from video path
-                        frames = extract_video_frames(example['video'], num_frames=num_video_frames)
+                        frames = extract_video_frames(video_obj, num_frames=num_video_frames)
                 except ImportError:
                     # torchcodec not available, use standard video extraction
-                    frames = extract_video_frames(example['video'], num_frames=num_video_frames)
+                    frames = extract_video_frames(video_obj, num_frames=num_video_frames)
                 except Exception as e:
                     # Other error occurred, try fallback
                     print(f"Warning: Error in video extraction ({str(e)}), trying fallback...")
-                    frames = extract_video_frames(example['video'], num_frames=num_video_frames)
+                    frames = extract_video_frames(video_obj, num_frames=num_video_frames)
 
                 if not frames:
                     raise ValueError("Failed to extract frames from video")
