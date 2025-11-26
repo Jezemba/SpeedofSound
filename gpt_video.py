@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+GPT-5 VQA Video Benchmark (Fair Comparison with gemma.py, Parallel)
+--------------------------------------------------------------------
+
+✅ Uses: OpenAI Responses API (GPT-5-2025-08-07)
+✅ Supports: Videos from HuggingFace dataset (no AWS)
+✅ Fair benchmark: 32 frames, 512 max tokens (matching gemma.py)
+✅ Output: CSV with results + timing info
+✅ Checkpointing: Resume from previous runs (CSV-based)
+✅ Parallel: --num_workers N (default = 1)
+"""
+
+import os
+import io
+import json
+import base64
+import argparse
+from pathlib import Path
+import pandas as pd
+from tqdm import tqdm
+from datasets import load_dataset
+from PIL import Image
+import time
+from multiprocessing import Pool
+
+from openai import OpenAI
+import cv2
+import numpy as np
+
+# -------------------------------------------------------------------
+# CONFIGURATION (Fair Benchmark Settings)
+# -------------------------------------------------------------------
+MODEL_NAME = "gpt-5-2025-08-07"
+MAX_OUTPUT_TOKENS = 512  # Match gemma.py (was 4096 in original)
+REASONING_EFFORT = "minimal"
+TEXT_VERBOSITY = "medium"
+
+# -------------------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------------------
+def image_to_base64_data_uri(image):
+    """
+    Convert PIL Image to base64 data URI for GPT-5 API.
+
+    Args:
+        image: PIL Image object
+
+    Returns:
+        Base64 encoded data URI string
+    """
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
+
+def extract_frames_from_videodecoder(video_decoder, num_frames=32):
+    """
+    Extract frames from a VideoDecoder object with middle frame guaranteed.
+
+    Args:
+        video_decoder: torchcodec VideoDecoder object
+        num_frames: Number of frames to extract
+
+    Returns:
+        List of PIL Image objects
+    """
+    total_frames = len(video_decoder)
+
+    # Calculate middle frame
+    middle_frame = total_frames // 2
+
+    # Generate frame indices with middle frame guaranteed (matching gemma.py)
+    if num_frames % 2 == 1:
+        # Odd number: sample symmetrically around middle
+        half_segments = num_frames // 2
+        indices_before = np.linspace(0, middle_frame - 1, half_segments, dtype=int)
+        indices_after = np.linspace(middle_frame + 1, total_frames - 1, half_segments, dtype=int)
+        frame_indices = np.concatenate([indices_before, [middle_frame], indices_after])
+    else:
+        # Even number: force middle frame at position num_frames//2
+        half_segments = num_frames // 2
+        if half_segments > 1:
+            indices_before = np.linspace(0, middle_frame - 1, half_segments - 1, dtype=int)
+        else:
+            indices_before = np.array([], dtype=int)
+        indices_after = np.linspace(middle_frame + 1, total_frames - 1, half_segments, dtype=int)
+        frame_indices = np.concatenate([indices_before, [middle_frame], indices_after])
+
+    # Ensure we have exactly num_frames
+    frame_indices = frame_indices[:num_frames]
+
+    # Extract frames as PIL Images
+    frames = []
+    for idx in frame_indices:
+        # Get tensor frame
+        tensor_frame = video_decoder[int(idx)]
+        # Convert to PIL
+        frame_np = tensor_frame.permute(1, 2, 0).cpu().numpy()
+        pil_image = Image.fromarray(frame_np.astype(np.uint8))
+        frames.append(pil_image)
+
+    return frames
+
+
+def extract_video_frames(video_path, num_frames=32):
+    """
+    Extract uniformly sampled frames from video with middle frame guaranteed.
+
+    Args:
+        video_path: Path to video file
+        num_frames: Number of frames to extract (default: 32)
+
+    Returns:
+        List of PIL Image objects
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total_frames == 0:
+        cap.release()
+        raise ValueError(f"Could not read video: {video_path}")
+
+    # Calculate middle frame
+    middle_frame = total_frames // 2
+
+    # Generate frame indices with middle frame guaranteed (matching gemma.py)
+    if num_frames % 2 == 1:
+        # Odd number: sample symmetrically around middle
+        half_segments = num_frames // 2
+        indices_before = np.linspace(0, middle_frame - 1, half_segments, dtype=int)
+        indices_after = np.linspace(middle_frame + 1, total_frames - 1, half_segments, dtype=int)
+        frame_indices = np.concatenate([indices_before, [middle_frame], indices_after])
+    else:
+        # Even number: force middle frame at position num_frames//2
+        half_segments = num_frames // 2
+        if half_segments > 1:
+            indices_before = np.linspace(0, middle_frame - 1, half_segments - 1, dtype=int)
+        else:
+            indices_before = np.array([], dtype=int)
+        indices_after = np.linspace(middle_frame + 1, total_frames - 1, half_segments, dtype=int)
+        frame_indices = np.concatenate([indices_before, [middle_frame], indices_after])
+
+    # Ensure we have exactly num_frames
+    frame_indices = frame_indices[:num_frames]
+
+    # Extract frames
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+        if ret:
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            frames.append(pil_image)
+
+    cap.release()
+    return frames
+
+
+def build_system_prompt():
+    """Build a system prompt to guide the model's behavior"""
+    return (
+        "You are a visual question answering assistant. You MUST follow this exact format:\n\n"
+        "FORMAT REQUIREMENTS:\n"
+        "Line 1: Copy the EXACT answer text from the provided options (word-for-word, including all symbols)\n"
+        "Line 2: One brief explanation sentence (10-15 words)\n\n"
+        "CRITICAL RULES:\n"
+        "1. The first line MUST be an EXACT COPY of one option - do not paraphrase or summarize\n"
+        "2. Copy ALL words, punctuation, and mathematical symbols exactly as shown in the option\n"
+        "3. Do NOT add phrases like 'The answer is' or explanatory text on line 1\n"
+        "4. Do NOT shorten or reword long options - copy them completely\n\n"
+        "EXAMPLE 1 (Simple):\n"
+        "Question: Is the sky blue?\n"
+        "Options: Yes, No\n"
+        "CORRECT:\n"
+        "Yes\n"
+        "The clear atmosphere scatters blue wavelengths effectively.\n\n"
+        "EXAMPLE 2 (Complex option with symbols):\n"
+        "Question: What is the range?\n"
+        "Options: Less than 10× min, More than 1000× min\n"
+        "CORRECT:\n"
+        "More than 1000× min\n"
+        "The values span from 7 billion to 1.6 trillion.\n\n"
+        "INCORRECT:\n"
+        "More than three orders of magnitude\n"
+        "(This paraphrases instead of copying the exact option)\n\n"
+        "Remember: Line 1 = EXACT COPY of option. Line 2 = explanation."
+    )
+
+
+def build_prompt(example):
+    """Structured prompt identical to gemma.py logic."""
+    question = example["question"]
+    choices = example.get("answer_choices", [])
+    prompt = f"{question}\n\n"
+    if choices:
+        prompt += "Answer options:\n"
+        for c in choices:
+            prompt += f"- {c}\n"
+        prompt += "\n"
+    prompt += (
+        "Instructions:\n"
+        "1. First line: Provide ONLY your answer exactly as it appears in the options above.\n"
+        "2. Second line onwards: Provide a brief summary explaining your reasoning.\n\n"
+        "Answer:"
+    )
+    return prompt
+
+
+def parse_model_response(text, answer_choices):
+    """Extract answer + explanation."""
+    lines = text.strip().split("\n")
+    if not lines:
+        return None, ""
+    first = lines[0].strip()
+    explanation = "\n".join(lines[1:]).strip()
+    if answer_choices:
+        for c in answer_choices:
+            if first.lower() == c.strip().lower():
+                return c.strip(), explanation
+        return None, explanation
+    return first, explanation
+
+
+def evaluate(model_answer, ground_truth, answer_choices):
+    """Boolean correctness."""
+    if model_answer is None:
+        return False
+    if model_answer.strip().lower() == ground_truth.strip().lower():
+        return True
+    if answer_choices:
+        for c in answer_choices:
+            if (
+                model_answer.strip().lower() == c.strip().lower()
+                and c.strip().lower() == ground_truth.strip().lower()
+            ):
+                return True
+    return False
+
+
+def openai_respond(user_content, system_prompt=None):
+    """Wrapper for GPT-5 Responses API call with optional system prompt."""
+    client = OpenAI()
+    input_messages = []
+
+    # Add system message if provided (OpenAI recommendation)
+    if system_prompt:
+        input_messages.append({"role": "system", "content": system_prompt})
+
+    # Add user message
+    input_messages.append({"role": "user", "content": user_content})
+
+    resp = client.responses.create(
+        model=MODEL_NAME,
+        input=input_messages,
+        reasoning={"effort": REASONING_EFFORT},
+        text={"verbosity": TEXT_VERBOSITY},
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+    )
+    return resp.output_text
+
+
+# -------------------------------------------------------------------
+# SINGLE EXAMPLE INFERENCE
+# -------------------------------------------------------------------
+def run_single_example(example, num_video_frames=32):
+    """Handles video examples using HuggingFace dataset directly."""
+    media_type = example["media_type"]
+
+    if media_type != "video":
+        raise ValueError(f"This script is for video benchmarking only. Got: {media_type}")
+
+    prompt = build_prompt(example)
+    system_prompt = build_system_prompt()
+
+    # Get video from dataset
+    video = example["video"]
+
+    # Handle VideoDecoder objects or paths
+    try:
+        from torchcodec.decoders import VideoDecoder
+        if isinstance(video, VideoDecoder):
+            # Extract frames directly from VideoDecoder
+            frames = extract_frames_from_videodecoder(video, num_frames=num_video_frames)
+        else:
+            # Extract frames from video path
+            frames = extract_video_frames(video, num_frames=num_video_frames)
+    except (ImportError, Exception):
+        # Fallback to standard video extraction
+        frames = extract_video_frames(video, num_frames=num_video_frames)
+
+    if not frames:
+        raise ValueError(f"No frames extracted from video {example.get('file_name', 'unknown')}")
+
+    # Convert frames to base64 data URIs
+    frames_base64 = []
+    for frame in frames:
+        frame_data_uri = image_to_base64_data_uri(frame)
+        frames_base64.append(frame_data_uri)
+
+    # Build GPT-5 multi-image input
+    user_content = [
+        {"type": "input_text", "text": f"These are {len(frames)} frames from a video. {prompt}"}
+    ]
+    for frame_b64 in frames_base64:
+        user_content.append({"type": "input_image", "image_url": frame_b64})
+
+    # Send to GPT-5
+    text = openai_respond(user_content, system_prompt=system_prompt)
+    ans, expl = parse_model_response(text, example.get("answer_choices"))
+    return ans, expl, text
+
+
+# -------------------------------------------------------------------
+# WORKER FUNCTION
+# -------------------------------------------------------------------
+def worker_process(args):
+    """Executed in each process."""
+    (worker_id, indices, dataset, out_csv, num_video_frames) = args
+    worker_results = []
+    for idx in tqdm(indices, desc=f"Worker {worker_id}", position=worker_id):
+        try:
+            ex = dataset[idx]
+            start_time = time.time()
+            model_answer, explanation, full_text = run_single_example(ex, num_video_frames=num_video_frames)
+            is_correct = evaluate(model_answer, ex["answer"], ex.get("answer_choices"))
+            processing_time = time.time() - start_time
+
+            res = {
+                "idx": idx,
+                "file_name": ex.get("file_name"),
+                "source_file": ex.get("source_file"),
+                "question": ex.get("question"),
+                "question_type": ex.get("question_type"),
+                "question_id": ex.get("question_id"),
+                "answer": ex.get("answer"),
+                "answer_choices": str(ex.get("answer_choices")),
+                "correct_choice_idx": ex.get("correct_choice_idx"),
+                "model": MODEL_NAME,
+                "model_answer": model_answer if model_answer else "None",
+                "explanation": explanation,
+                "correct": is_correct,
+                "media_type": ex.get("media_type"),
+                "processing_time": processing_time
+            }
+            worker_results.append(res)
+
+            # Write incremental CSV for this worker
+            if len(worker_results) % 5 == 0:
+                pd.DataFrame(worker_results).to_csv(out_csv, index=False)
+
+        except Exception as e:
+            print(f"[Worker {worker_id}] Example {idx} failed: {e}")
+            continue
+
+    pd.DataFrame(worker_results).to_csv(out_csv, index=False)
+    return out_csv
+
+
+# -------------------------------------------------------------------
+# MAIN DRIVER
+# -------------------------------------------------------------------
+def run_benchmark(dataset_name, split="test", output_csv="gptV_results.csv",
+                  checkpoint="gptV_checkpoint.pkl", max_examples=None,
+                  num_video_frames=32, num_workers=1):
+
+    print(f"🔹 Loading dataset: {dataset_name}")
+    dset = load_dataset(dataset_name, split=split, token=True)
+
+    # Filter for video examples only
+    print(f"Filtering dataset for video examples only...")
+    video_indices = [i for i, m in enumerate(dset["media_type"]) if m == "video"]
+    dset = dset.select(video_indices)
+    print(f"✅ Total videos to process: {len(dset)}")
+
+    total = len(dset)
+    if max_examples:
+        total = min(total, max_examples)
+        dset = dset.select(range(total))
+
+    # Check for existing results to resume from (CSV-based checkpointing)
+    processed_indices = set()
+    old_results = []
+
+    # Check for final output file
+    if os.path.exists(output_csv):
+        print(f"\n📂 Found existing results file: {output_csv}")
+        old_df = pd.read_csv(output_csv)
+        if "idx" in old_df.columns:
+            processed_indices = set(old_df["idx"].values)
+            old_results = old_df.to_dict('records')
+            print(f"   Loaded {len(processed_indices)} completed examples from {output_csv}")
+
+    # Also check for any worker CSV files from interrupted runs
+    worker_files = []
+    for w in range(100):  # Check up to 100 workers
+        worker_csv = f"gptV_results_worker_{w}.csv"
+        if os.path.exists(worker_csv):
+            worker_files.append(worker_csv)
+
+    if worker_files:
+        print(f"\n📂 Found {len(worker_files)} worker checkpoint files from previous run")
+        for wf in worker_files:
+            try:
+                wf_df = pd.read_csv(wf)
+                if "idx" in wf_df.columns:
+                    new_indices = set(wf_df["idx"].values) - processed_indices
+                    if new_indices:
+                        processed_indices.update(new_indices)
+                        old_results.extend(wf_df.to_dict('records'))
+                        print(f"   Loaded {len(new_indices)} additional examples from {wf}")
+            except Exception as e:
+                print(f"   Warning: Could not load {wf}: {e}")
+
+    if processed_indices:
+        print(f"   Total resuming from checkpoint: {len(processed_indices)} examples already processed")
+
+    # Get unprocessed indices
+    all_indices = list(range(total))
+    unprocessed_indices = [i for i in all_indices if i not in processed_indices]
+
+    print(f"\n🚀 Starting GPT-5 Video Benchmark (Fair Comparison)...")
+    print(f"   Model: {MODEL_NAME}")
+    print(f"   Max Output Tokens: {MAX_OUTPUT_TOKENS} (matching gemma.py)")
+    print(f"   Video Frames: {num_video_frames} (matching gemma.py)")
+    print(f"   Total examples: {total}")
+    print(f"   Already processed: {len(processed_indices)}")
+    print(f"   Remaining: {len(unprocessed_indices)}")
+    print(f"   Using {num_workers} workers")
+
+    # If all examples are already processed, skip to results
+    if len(unprocessed_indices) == 0:
+        print("\n✅ All examples already processed!")
+        all_df = pd.DataFrame(old_results)
+    else:
+        # Split unprocessed indices among workers
+        chunks = [unprocessed_indices[i::num_workers] for i in range(num_workers)]
+
+        worker_args = []
+        for w, chunk in enumerate(chunks):
+            if len(chunk) > 0:  # Only create worker if it has work to do
+                worker_csv = f"gptV_results_worker_{w}.csv"
+                worker_args.append((w, chunk, dset, worker_csv, num_video_frames))
+
+        if num_workers > 1 and len(worker_args) > 1:
+            with Pool(processes=len(worker_args)) as pool:
+                worker_csvs = pool.map(worker_process, worker_args)
+        else:
+            worker_csvs = [worker_process(worker_args[0])] if worker_args else []
+
+        # Merge new results with old results
+        new_dfs = [pd.read_csv(f) for f in worker_csvs if os.path.exists(f)]
+        if old_results:
+            all_dfs = [pd.DataFrame(old_results)] + new_dfs
+        else:
+            all_dfs = new_dfs
+
+        all_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+
+        # Clean up worker files after successful merge
+        for worker_csv in worker_csvs:
+            try:
+                if os.path.exists(worker_csv):
+                    os.remove(worker_csv)
+            except Exception as e:
+                print(f"   Warning: Could not remove {worker_csv}: {e}")
+
+    # Save final results
+    all_df.to_csv(output_csv, index=False)
+
+    # Calculate statistics
+    correct = all_df["correct"].sum()
+    total_processed = len(all_df)
+    acc = correct / total_processed if total_processed else 0
+    failed_answers = (all_df["model_answer"] == "None").sum()
+
+    # Calculate accuracy by question type
+    stats_by_type = {}
+    accuracy_by_type = {}
+
+    if "question_type" in all_df.columns:
+        for q_type in all_df["question_type"].unique():
+            if pd.notna(q_type):
+                type_df = all_df[all_df["question_type"] == q_type]
+                type_correct = type_df["correct"].sum()
+                type_total = len(type_df)
+                stats_by_type[q_type] = {'correct': type_correct, 'total': type_total}
+                accuracy_by_type[q_type] = type_correct / type_total if type_total > 0 else 0
+
+    print("\n" + "=" * 80)
+    print("GPT-5 VIDEO BENCHMARK RESULTS (Fair Comparison)")
+    print("=" * 80)
+    print(f"Model: {MODEL_NAME}")
+    print(f"Max Output Tokens: {MAX_OUTPUT_TOKENS}")
+    print(f"Video Frames: {num_video_frames}")
+    print(f"Overall Accuracy: {acc:.2%} ({correct}/{total_processed})")
+    print(f"Failed to provide valid answer: {failed_answers}/{total_processed} ({failed_answers/total_processed*100:.1f}%)")
+
+    if stats_by_type:
+        print(f"\nAccuracy by Question Type:")
+        for q_type in sorted(stats_by_type.keys()):
+            stats = stats_by_type[q_type]
+            type_acc = accuracy_by_type[q_type]
+            print(f"  {q_type}: {type_acc:.2%} ({stats['correct']}/{stats['total']})")
+
+    print(f"\nResults saved to: {output_csv}")
+    print("=" * 80)
+
+
+# -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="GPT-5 Video Benchmark (Fair Comparison with gemma.py, Parallel)")
+    parser.add_argument("--dataset", type=str, default="JessicaE/OpenSeeSimE-Structural")
+    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--output", type=str, default="gptV_results.csv")
+    parser.add_argument("--checkpoint", type=str, default="gptV_checkpoint.pkl")
+    parser.add_argument("--max_examples", type=int, default=0)
+    parser.add_argument("--num_frames", type=int, default=32,
+                       help="Number of frames to extract from videos (default: 32, matching gemma.py)")
+    parser.add_argument("--num_workers", type=int, default=1,
+                       help="Number of parallel workers (default: 1)")
+    args = parser.parse_args()
+
+    max_examples = None if args.max_examples <= 0 else args.max_examples
+
+    print("\n" + "=" * 80)
+    print("GPT-5 VIDEO BENCHMARK (Fair Comparison - Parallel)")
+    print("=" * 80)
+    print(f"Model: {MODEL_NAME}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Video Frames: {args.num_frames} (matching gemma.py baseline)")
+    print(f"Max Output Tokens: {MAX_OUTPUT_TOKENS} (matching gemma.py baseline)")
+    print(f"Workers: {args.num_workers}")
+    print(f"Output File: {args.output}")
+    print(f"Checkpoint File: {args.checkpoint}")
+    print("=" * 80 + "\n")
+
+    run_benchmark(
+        dataset_name=args.dataset,
+        split=args.split,
+        output_csv=args.output,
+        checkpoint=args.checkpoint,
+        max_examples=max_examples,
+        num_video_frames=args.num_frames,
+        num_workers=max(1, args.num_workers),
+    )
+
+
+if __name__ == "__main__":
+    main()
