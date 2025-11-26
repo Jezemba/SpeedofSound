@@ -88,7 +88,7 @@ def load_benchmark_dataset(dataset_name, split='test'):
         Dataset object
     """
     print(f"Loading dataset: {dataset_name}")
-    dataset = load_dataset(dataset_name, split=split, token=True)
+    dataset = load_dataset(dataset_name, split=split, token=True, download_mode="force_redownload")
     print(f"Loaded {len(dataset)} examples")
     return dataset
 
