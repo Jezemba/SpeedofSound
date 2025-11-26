@@ -202,7 +202,8 @@ def prepare_claude_messages(example, media_type, frames=None):
     Returns:
         content list in Claude API format
     """
-    question = example['question']
+    # Modify question to include medium (water/air) based on source_file
+    question = modify_question_for_medium(example['question'], example['source_file'])
     answer_choices = example['answer_choices']
 
     # Build structured prompt
@@ -452,16 +453,7 @@ def run_benchmark(dataset_name, output_file='results_claude.csv', checkpoint_fil
     filtered_indices = [i for i, qid in enumerate(question_ids) if qid == 12]
     dataset = dataset.select(filtered_indices)
     print(f"Remaining examples after question_id filter: {len(dataset)}")
-
-    # Modify questions based on source_file to include medium (water/air)
-    print(f"Modifying questions to include medium (water/air) based on source_file...")
-    # Create a modified dataset with updated questions
-    def modify_example_question(example):
-        example['question'] = modify_question_for_medium(example['question'], example['source_file'])
-        return example
-
-    dataset = dataset.map(modify_example_question)
-    print(f"Questions modified successfully")
+    print(f"Note: Questions will be modified on-the-fly to include medium (water/air) based on source_file")
 
     # Optional filtering by media type
     if media_type != "all":

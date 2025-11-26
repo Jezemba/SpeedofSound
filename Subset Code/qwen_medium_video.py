@@ -169,15 +169,8 @@ def run_benchmark(
     dataset = dataset.select(filtered_indices)
     print(f"Remaining examples after question_id filter: {len(dataset)}")
 
-    # Modify questions based on source_file to include medium (water/air)
-    print(f"Modifying questions to include medium (water/air) based on source_file...")
-    # Create a modified dataset with updated questions
-    def modify_example_question(example):
-        example['question'] = modify_question_for_medium(example['question'], example['source_file'])
-        return example
-
-    dataset = dataset.map(modify_example_question)
-    print(f"Questions modified successfully")
+    # Note: Questions will be modified on-the-fly to include medium (water/air)
+    print(f"Note: Questions will be modified on-the-fly to include medium (water/air) based on source_file")
 
     # Filter for video examples
     video_indices = [i for i, m in enumerate(dataset["media_type"]) if m == "video"]
@@ -237,7 +230,7 @@ def run_benchmark(
                 continue
 
             file_name = example["file_name"]
-            question = example["question"]
+            question = modify_question_for_medium(example["question"], example["source_file"])
             answer_choices = example["answer_choices"]
             ground_truth = example["answer"]
 

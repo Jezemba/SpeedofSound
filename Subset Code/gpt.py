@@ -179,7 +179,7 @@ def build_system_prompt():
 
 def build_prompt(example):
     """Structured prompt identical to InternVL logic."""
-    question = example["question"]
+    question = modify_question_for_medium(example['question'], example['source_file'])
     choices = example.get("answer_choices", [])
     prompt = f"{question}\n\n"
     if choices:
@@ -361,15 +361,7 @@ def run_benchmark(dataset_name, split="test", output_csv="gpt5_noaws_vqa_results
     dset = dset.select(filtered_indices)
     print(f"Remaining examples after question_id filter: {len(dset)}")
 
-    # Modify questions based on source_file to include medium (water/air)
-    print(f"Modifying questions to include medium (water/air) based on source_file...")
-    # Create a modified dataset with updated questions
-    def modify_example_question(example):
-        example['question'] = modify_question_for_medium(example['question'], example['source_file'])
-        return example
-
-    dset = dset.map(modify_example_question)
-    print(f"Questions modified successfully")
+    print(f"Note: Questions will be modified on-the-fly to include medium (water/air) based on source_file")
 
     # Optional filtering by media type
     if media_type != "all":

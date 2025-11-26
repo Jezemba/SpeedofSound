@@ -435,15 +435,8 @@ def process_dataset(args):
     dataset = dataset.select(filtered_indices)
     print(f"Remaining examples after question_id filter: {len(dataset)}")
 
-    # Modify questions based on source_file to include medium (water/air)
-    print(f"Modifying questions to include medium (water/air) based on source_file...")
-    # Create a modified dataset with updated questions
-    def modify_example_question(example):
-        example['question'] = modify_question_for_medium(example['question'], example['source_file'])
-        return example
-
-    dataset = dataset.map(modify_example_question)
-    print(f"Questions modified successfully")
+    # Note: Questions will be modified on-the-fly to include medium (water/air)
+    print(f"Note: Questions will be modified on-the-fly to include medium (water/air) based on source_file")
 
     # Filter by media type if specified
     if args.media_type != 'all':
@@ -522,7 +515,7 @@ def process_dataset(args):
                 media_type = example['media_type']
 
                 # Prepare prompts
-                question = example['question']
+                question = modify_question_for_medium(example['question'], example['source_file'])
                 answer_choices = example['answer_choices']
                 user_prompt = prepare_user_prompt(question, answer_choices)
                 system_prompt = build_system_prompt()
