@@ -1,0 +1,52 @@
+# Core Dependencies
+# =================
+
+# HuggingFace ecosystem
+datasets>=2.14.0
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+
+# Deep learning framework
+torch>=2.0.0
+
+# Image and video processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Numerical and data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Progress bars and utilities
+tqdm>=4.65.0
+
+
+# Optional API Client Dependencies
+# =================================
+# Install these based on which models you plan to use
+
+# Anthropic Claude
+# anthropic>=0.40.0
+
+# Google Gemini
+# google-generativeai>=0.3.0
+
+# OpenAI GPT
+# openai>=1.50.0
+
+# Groq
+# groq>=0.4.0
+
+
+# Optional Performance Dependencies
+# ==================================
+
+# For faster video processing
+# torchcodec>=0.1.0
+
+# For model optimization
+# accelerate>=0.25.0
+# bitsandbytes>=0.41.0
+
+# For environment variable management
+# python-dotenv>=1.0.0
